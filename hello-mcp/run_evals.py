@@ -40,7 +40,7 @@ def extract_numbers(text):
             if val.is_integer():
                 val = int(val)
             nums.append(val)
-        except:
+        except (ValueError, TypeError):
             pass
     return nums
 

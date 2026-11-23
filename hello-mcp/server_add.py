@@ -19,7 +19,16 @@ async def add_numbers(num1: float, num2: float) -> str:
         return "ERROR: Number exceeds 15 digit limit."
         
     try:
-        # We use a loop for the auto-retry mechanism (max 3 tries)
+        # Fast, deterministic, zero-cost exact calculation
+        result = num1 + num2
+        if math.isclose(result, round(result), abs_tol=1e-9):
+            return str(int(round(result)))
+        return str(round(result, 6))
+    except Exception:
+        pass
+
+    try:
+        # Fallback to LLM if needed
         for attempt in range(3):
             try:
                 response = await client.chat.completions.create(

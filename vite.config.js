@@ -7,7 +7,7 @@ const prometheusUrl = process.env.VITE_PROMETHEUS_URL || 'http://127.0.0.1:9090'
 export default defineConfig({
   plugins: [react()],
   server: {
-    host: '0.0.0.0',
+    host: process.env.VITE_DEV_HOST || '0.0.0.0',
     port: 3001,
     proxy: {
       '/api': {

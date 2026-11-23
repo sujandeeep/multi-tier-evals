@@ -9,6 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Create non-root app user
+RUN groupadd --gid 1001 appgroup && \
+    useradd --uid 1001 --gid appgroup --no-create-home --shell /bin/false appuser
+
 # Install python dependencies with clean dependency resolution
 RUN pip install --no-cache-dir \
     fastapi \
@@ -29,6 +33,10 @@ RUN pip install --no-cache-dir \
     pip install --no-cache-dir --no-deps ragflow-sdk==0.22.1
 
 COPY . .
+
+RUN chown -R appuser:appgroup /app
+
+USER appuser
 
 ENV PYTHONUNBUFFERED=1
 ENV DATABASE_URL="postgresql://postgres:postgres@postgres:5432/mathrouter"

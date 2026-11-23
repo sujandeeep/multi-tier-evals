@@ -5,17 +5,42 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
+from psycopg import sql
 
 from src.server import ask_rag, ingest_document
 from src.db import fetch_recent_evaluations, get_connection
 from src.metrics import start_metrics_server, record_evaluation_metrics
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
-app = FastAPI(title="RAG Evaluation & Viewport API", version="2.0.0")
+# FastAPI Lifespan context manager replacing deprecated @app.on_event("startup")
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: synchronize historical metrics
+    try:
+        sync_metrics_from_db()
+    except Exception as e:
+        print(f"[Lifespan Startup] Notice: {e}")
+    yield
+    # Shutdown logic if needed
+
+app = FastAPI(title="RAG Evaluation & Viewport API", version="2.0.0", lifespan=lifespan)
+
+# Security Fix: Support explicit allowed origins from environment variable while keeping local dev functional
+default_origins = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001"
+]
+env_origins = os.getenv("ALLOWED_ORIGINS")
+origins = [o.strip() for o in env_origins.split(",") if o.strip()] if env_origins else default_origins
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins if origins else ["*"],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -63,10 +88,6 @@ def sync_metrics_from_db():
                 print(f"[Prometheus] Synchronized {len(rows)} evaluations from PostgreSQL into Prometheus.")
     except Exception as e:
         print(f"[Prometheus] Metrics sync warning: {e}")
-
-@app.on_event("startup")
-def on_startup():
-    sync_metrics_from_db()
 
 @app.get("/metrics")
 @app.get("/metrics/")
@@ -166,6 +187,20 @@ def delete_duplicate_evaluations():
         conn.commit()
     return {"status": "ok", "deleted_count": deleted_count}
 
+RIGID_DOCS_DIR = os.path.realpath(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rigid_docs"))
+if not os.path.exists(RIGID_DOCS_DIR):
+    os.makedirs(RIGID_DOCS_DIR, exist_ok=True)
+
+def safe_rigid_doc_path(filename: str) -> str:
+    """Validates and returns an absolute safe path within rigid_docs, preventing path traversal."""
+    cleaned = os.path.basename(filename.strip().replace("\\", "/"))
+    if not cleaned or cleaned in [".", ".."]:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    full_path = os.path.realpath(os.path.join(RIGID_DOCS_DIR, cleaned))
+    if not full_path.startswith(RIGID_DOCS_DIR + os.sep) and full_path != RIGID_DOCS_DIR:
+        raise HTTPException(status_code=400, detail="Directory traversal attempt detected")
+    return full_path
+
 @app.post("/api/query")
 def execute_rag_query(req: QueryRequest):
     """Executes a RAG query and returns response, confidence score, and atomic claims."""
@@ -187,10 +222,13 @@ def execute_ingest(req: IngestRequest):
     """Ingests a document into the RAG engine via file_path or raw text content."""
     target_path = req.file_path
     if not target_path and req.content and req.filename:
-        os.makedirs("rigid_docs", exist_ok=True)
-        target_path = os.path.join("rigid_docs", req.filename)
+        target_path = safe_rigid_doc_path(req.filename)
         with open(target_path, "w", encoding="utf-8") as f:
             f.write(req.content)
+    elif target_path:
+        # Validate target_path if it's within rigid_docs or relative
+        if not os.path.isabs(target_path):
+            target_path = safe_rigid_doc_path(target_path)
     
     if not target_path or not os.path.exists(target_path):
         raise HTTPException(status_code=400, detail=f"Invalid file or content. Target: {target_path}")
@@ -198,14 +236,16 @@ def execute_ingest(req: IngestRequest):
     res = ingest_document(file_path=target_path, dataset_name=req.dataset_name)
     return res
 
+MAX_UPLOAD_SIZE_BYTES = 50 * 1024 * 1024 # 50 MB
+
 @app.post("/api/upload")
 async def upload_and_ingest(file: UploadFile = File(...), dataset_name: str = "default_kb"):
     """Accepts any PDF, TXT, DOCX, or other document file, saves it, and ingests into pgvector."""
-    os.makedirs("rigid_docs", exist_ok=True)
-    filename = file.filename
-    target_path = os.path.join("rigid_docs", filename)
+    target_path = safe_rigid_doc_path(file.filename or "uploaded_doc")
+    content = await file.read(MAX_UPLOAD_SIZE_BYTES + 1)
+    if len(content) > MAX_UPLOAD_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="File size exceeds maximum allowed limit (50MB)")
     with open(target_path, "wb") as f:
-        content = await file.read()
         f.write(content)
     
     res = ingest_document(file_path=target_path, dataset_name=dataset_name)
@@ -248,7 +288,7 @@ def get_document_content(doc_name: str):
         chunks.append(rd)
         
     # 2. Check if file exists on disk
-    file_path = os.path.join("rigid_docs", doc_name)
+    file_path = safe_rigid_doc_path(doc_name)
     has_file = os.path.exists(file_path)
     file_size = os.path.getsize(file_path) if has_file else 0
     ext = os.path.splitext(doc_name)[1].lower()
@@ -278,7 +318,7 @@ def get_document_content(doc_name: str):
 @app.get("/api/documents/{doc_name}/file")
 def get_document_file(doc_name: str):
     """Serves raw document file for direct inline in-browser PDF or doc view without download prompts."""
-    file_path = os.path.join("rigid_docs", doc_name)
+    file_path = safe_rigid_doc_path(doc_name)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found on server")
     
@@ -336,14 +376,15 @@ def get_db_overview():
             tables = [r["table_name"] for r in cur.fetchall()]
             stats = []
             for t in tables:
-                cur.execute(f"SELECT count(*) as cnt FROM {t};")
+                # Security Fix: Prevent SQL injection using parameterized sql.Identifier
+                cur.execute(sql.SQL("SELECT count(*) as cnt FROM {}").format(sql.Identifier(t)))
                 cnt = cur.fetchone()["cnt"]
-                cur.execute(f"""
+                cur.execute("""
                     SELECT column_name, data_type 
                     FROM information_schema.columns 
-                    WHERE table_name = '{t}'
+                    WHERE table_name = %s
                     ORDER BY ordinal_position;
-                """)
+                """, (t,))
                 cols = [{"name": c["column_name"], "type": c["data_type"]} for c in cur.fetchall()]
                 stats.append({"table": t, "row_count": cnt, "columns": cols})
             return {"tables": stats}
@@ -351,7 +392,10 @@ def get_db_overview():
 @app.get("/api/db/table/{table_name}")
 def get_db_table_data(table_name: str, limit: int = 50, offset: int = 0):
     """Returns real live rows from any PostgreSQL table."""
-    allowed_tables = ["document_embeddings", "rag_evaluations"]
+    limit = max(1, min(limit, 500)) # Bound pagination
+    offset = max(0, offset)
+    
+    allowed_tables = ["document_embeddings", "rag_evaluations", "eval_sessions", "eval_turns"]
     if table_name not in allowed_tables:
         raise HTTPException(status_code=400, detail="Invalid table name")
     
@@ -367,13 +411,12 @@ def get_db_table_data(table_name: str, limit: int = 50, offset: int = 0):
                     LIMIT %s OFFSET %s;
                 """, (limit, offset))
             else:
-                cur.execute(f"""
-                    SELECT * FROM {table_name}
-                    ORDER BY id DESC
-                    LIMIT %s OFFSET %s;
-                """, (limit, offset))
+                cur.execute(
+                    sql.SQL("SELECT * FROM {} ORDER BY id DESC LIMIT %s OFFSET %s").format(sql.Identifier(table_name)),
+                    (limit, offset)
+                )
             rows = cur.fetchall()
-            cur.execute(f"SELECT count(*) as cnt FROM {table_name};")
+            cur.execute(sql.SQL("SELECT count(*) as cnt FROM {}").format(sql.Identifier(table_name)))
             total = cur.fetchone()["cnt"]
             
             formatted = []

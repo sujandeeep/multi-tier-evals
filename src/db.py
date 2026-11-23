@@ -8,7 +8,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5434/mathrouter")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    DATABASE_URL = "postgresql://postgres:postgres@localhost:5434/mathrouter"
 
 def get_connection():
     conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)

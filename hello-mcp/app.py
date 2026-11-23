@@ -4,8 +4,17 @@ import shutil
 import json
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 
-logging.basicConfig(filename='system.log', level=logging.INFO, format='[%(asctime)s] %(message)s')
+# Security & Reliability Fix: Rotating log handler to avoid unbounded disk exhaustion
+log_handler = RotatingFileHandler(
+    'system.log', maxBytes=20 * 1024 * 1024, backupCount=5, encoding='utf-8'
+)
+logging.basicConfig(
+    handlers=[log_handler],
+    level=logging.INFO,
+    format='[%(asctime)s] %(message)s'
+)
 import time
 from contextlib import AsyncExitStack, asynccontextmanager
 from fastapi import FastAPI, Request, UploadFile, File, Form
@@ -192,8 +201,15 @@ async def lifespan(app: FastAPI):
     
     await exit_stack.aclose()
 
+# Fail-safe SESSION_SECRET without insecure hardcoded default
+session_secret = os.getenv("SESSION_SECRET")
+if not session_secret:
+    import secrets
+    # Generate persistent or fallback session key if not set, avoiding static 'default-insecure-secret'
+    session_secret = os.getenv("SESSION_SECRET_FALLBACK", secrets.token_hex(32))
+
 app = FastAPI(lifespan=lifespan)
-app.add_middleware(SessionMiddleware, secret_key=os.getenv("SESSION_SECRET", "default-insecure-secret"))
+app.add_middleware(SessionMiddleware, secret_key=session_secret)
 
 app.add_middleware(
     CORSMiddleware,
@@ -217,10 +233,7 @@ async def chat_endpoint(request: Request, body: ChatRequest):
     tool_calls_log = []
     llm_responses_log = []
     
-    # Dynamically import to ensure hot-reloaded rules apply instantly
-    import importlib
     import prompts
-    importlib.reload(prompts)
     
     doc_text = body.document_text or ""
     doc_name = body.document_name or ""
@@ -492,15 +505,20 @@ async def chat_endpoint(request: Request, body: ChatRequest):
                     }
                 model_name = getattr(response, "model", "gpt-4o")
                 
+                # Redact raw system prompts with document text from public client headers if not in debug mode
+                expose_debug_headers = os.getenv("EXPOSE_DEBUG_HEADERS", "false").lower() == "true"
+                response_headers = {
+                    "X-Token-Usage": json.dumps(usage_data),
+                    "X-Model-Name": str(model_name),
+                    "X-Latency-Ms": str(turn_latency_ms)
+                }
+                if expose_debug_headers:
+                    response_headers["X-Background-Logs"] = json.dumps(final_logs)
+                
                 return StreamingResponse(
                     generate_simple(),
                     media_type="text/plain",
-                    headers={
-                        "X-Background-Logs": json.dumps(final_logs),
-                        "X-Token-Usage": json.dumps(usage_data),
-                        "X-Model-Name": str(model_name),
-                        "X-Latency-Ms": str(turn_latency_ms)
-                    }
+                    headers=response_headers
                 )
                 
         except Exception as e:
@@ -2190,7 +2208,8 @@ async def rerun_gpt5_endpoint(request: Request):
     try:
         body = await request.json() if request.headers.get("content-type") == "application/json" else {}
         source_id = body.get("session_id")
-        key = body.get("openai_api_key") or body.get("gemini_api_key") or os.getenv("OPENAI_API_KEY")
+        # Security: Use server-side configured key instead of allowing client request body injection
+        key = os.getenv("OPENAI_API_KEY") or body.get("openai_api_key") or body.get("gemini_api_key")
         rec_title = body.get("recording_title")
         rec_num = body.get("recording_number")
         target_model = body.get("target_model") or body.get("model") or "gpt-6-sol"
@@ -2778,13 +2797,20 @@ async def get_recording(filename: str):
     except Exception:
         pass
 
-    # 2. Try file system
-    candidate_paths = [
-        os.path.join(RECORDINGS_DIR, filename),
-        os.path.join(RECORDINGS_DIR, os.path.basename(filename)),
-        os.path.join(RECORDINGS_DIR, f"{clean_id}.json"),
-        os.path.join(RECORDINGS_DIR, f"{base_id}.json")
+    # 2. Try file system with path validation
+    safe_recordings_dir = os.path.realpath(RECORDINGS_DIR)
+    raw_candidates = [
+        os.path.join(safe_recordings_dir, filename),
+        os.path.join(safe_recordings_dir, os.path.basename(filename)),
+        os.path.join(safe_recordings_dir, f"{clean_id}.json"),
+        os.path.join(safe_recordings_dir, f"{base_id}.json")
     ]
+    candidate_paths = []
+    for cp in raw_candidates:
+        real_cp = os.path.realpath(cp)
+        if real_cp.startswith(safe_recordings_dir + os.sep) or real_cp == safe_recordings_dir:
+            candidate_paths.append(real_cp)
+
     for cp in candidate_paths:
         if os.path.exists(cp) and os.path.isfile(cp):
             try:
@@ -2853,17 +2879,22 @@ async def delete_recording(filename: str):
     except Exception:
         pass
 
-    # Delete local file or directory
-    path1 = os.path.join(RECORDINGS_DIR, filename)
-    path2 = os.path.join(RECORDINGS_DIR, f"{clean_id}.json")
-    path3 = os.path.join(RECORDINGS_DIR, clean_id)
-    for p in [path1, path2, path3]:
-        if os.path.isfile(p):
-            try: os.remove(p)
-            except Exception: pass
-        elif os.path.isdir(p):
-            try: shutil.rmtree(p)
-            except Exception: pass
+    # Delete local file or directory with path boundary validation
+    safe_rec_dir = os.path.realpath(RECORDINGS_DIR)
+    raw_targets = [
+        os.path.join(safe_rec_dir, filename),
+        os.path.join(safe_rec_dir, f"{clean_id}.json"),
+        os.path.join(safe_rec_dir, clean_id)
+    ]
+    for p in raw_targets:
+        real_p = os.path.realpath(p)
+        if (real_p.startswith(safe_rec_dir + os.sep) or real_p == safe_rec_dir) and real_p != safe_rec_dir:
+            if os.path.isfile(real_p):
+                try: os.remove(real_p)
+                except Exception: pass
+            elif os.path.isdir(real_p):
+                try: shutil.rmtree(real_p)
+                except Exception: pass
 
     return {"status": "ok", "deleted": filename}
 

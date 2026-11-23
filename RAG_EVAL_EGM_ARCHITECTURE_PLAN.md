@@ -75,11 +75,6 @@ User Query ─────────> [ RAG Retrieval API ]
     │ (Query + RAGFlow Chunks + Response)
     ▼
 [ THE GOLDFISH: gpt-6-astra Evaluator ]
-  • Atomic Claim Extraction (decomposes answer into micro-facts)
-  • Groundedness / Faithfulness Verification
-  • Context Relevance (Auditing RAGFlow's retrieval noise)
-  • Answer Relevancy & Intent Satisfaction
-  • Composite Confidence Calculation (0% - 100%)
     │
     ├──────────────────────────────────────────────────────────────┐
     ▼                                                              ▼
