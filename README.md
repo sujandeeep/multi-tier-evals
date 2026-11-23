@@ -180,6 +180,6 @@ rag-evals/
 
 ## 📄 License & Author
 
-* **Author:** Sujan ([thenameissujaa@gmail.com](mailto:thenameissujaa@gmail.com))
+* **Author:** Sujan
 * **Repository:** [sujandeeep/rag-evals](https://github.com/sujandeeep/rag-evals)
 * **License:** MIT License
